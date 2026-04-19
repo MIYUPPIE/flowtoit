@@ -1,0 +1,16 @@
+{
+  "name": "FlowToIt",
+  "short_name": "FlowToIt",
+  "description": "LAN peer-to-peer audio & video communication",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0c0c14",
+  "theme_color": "#623364",
+  "icons": [
+    {
+      "src": "/logo.png",
+      "sizes": "1042x1042",
+      "type": "image/png"
+    }
+  ]
+}
