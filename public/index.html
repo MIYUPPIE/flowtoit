@@ -2415,7 +2415,7 @@ async function createConnection(targetPeerId, isInitiator) {
   if (STATE.connections[targetPeerId]) return STATE.connections[targetPeerId].pc;
 
   const pc = new RTCPeerConnection(ICE_CONFIG);
-  const conn = { pc, remoteStream: new MediaStream(), videoBox: null, dataChannel: null };
+  const conn = { pc, remoteStream: new MediaStream(), videoBox: null, dataChannel: null, pendingCandidates: [] };
   STATE.connections[targetPeerId] = conn;
 
   // Set up DataChannel for file transfers
@@ -2455,7 +2455,6 @@ async function createConnection(targetPeerId, isInitiator) {
     };
     // Set up persistent audio that works in background
     ensurePersistentAudio(targetPeerId, conn.remoteStream);
-    routeThroughWebAudio(targetPeerId, conn.remoteStream);
     updateVideoGrid();
   };
 
@@ -2514,6 +2513,7 @@ async function createConnection(targetPeerId, isInitiator) {
 async function handleOffer(msg) {
   const pc = await createConnection(msg.from, false);
   await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+  await flushPendingCandidates(STATE.connections[msg.from]);
   const answer = await pc.createAnswer();
   await pc.setLocalDescription(answer);
   ws.send(JSON.stringify({
@@ -2529,18 +2529,42 @@ async function handleAnswer(msg) {
   const conn = STATE.connections[msg.from];
   if (conn) {
     await conn.pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+    await flushPendingCandidates(conn);
     updateVideoGrid();
     renderPeerList();
   }
 }
 
+// Candidates can arrive over the WebSocket before the offer/answer that
+// establishes the connection has finished being processed (e.g. while the
+// callee is still awaiting a getUserMedia() permission prompt). Calling
+// addIceCandidate() before a remote description is set fails, silently
+// dropping the candidate and sometimes preventing the call from connecting
+// at all — so queue candidates until the remote description is ready.
 async function handleIceCandidate(msg) {
   const conn = STATE.connections[msg.from];
-  if (conn) {
+  if (!conn) return;
+  const candidate = new RTCIceCandidate(msg.candidate);
+  if (!conn.pc.remoteDescription) {
+    conn.pendingCandidates.push(candidate);
+    return;
+  }
+  try {
+    await conn.pc.addIceCandidate(candidate);
+  } catch (err) {
+    console.warn('ICE candidate error', err);
+  }
+}
+
+async function flushPendingCandidates(conn) {
+  if (!conn || !conn.pendingCandidates.length) return;
+  const queued = conn.pendingCandidates;
+  conn.pendingCandidates = [];
+  for (const candidate of queued) {
     try {
-      await conn.pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+      await conn.pc.addIceCandidate(candidate);
     } catch (err) {
-      console.warn('ICE candidate error', err);
+      console.warn('ICE candidate error (queued)', err);
     }
   }
 }
@@ -2553,7 +2577,6 @@ function closeConnection(peerId) {
   }
   // Clean up persistent audio for this peer
   removePersistentAudio(peerId);
-  removeWebAudioRoute(peerId);
 
   if (Object.keys(STATE.connections).length === 0) {
     STATE.inCall = false;
@@ -2577,7 +2600,6 @@ function hangupAll() {
     const conn = STATE.connections[pid];
     if (conn) conn.pc.close();
     removePersistentAudio(pid);
-    removeWebAudioRoute(pid);
     delete STATE.connections[pid];
   }
   STATE.inCall = false;
@@ -2690,15 +2712,18 @@ $('#btn-accept').addEventListener('click', async () => {
   for (const call of STATE.pendingCalls) {
     try {
       if (call.type === 'individual') {
-        // Tell caller we accepted
+        // Tell caller we accepted — the caller sends the SDP offer once they
+        // get this. We must NOT create our own connection here: if both
+        // sides call createConnection(peerId, true) we each send a
+        // competing offer (glare), which leaves signaling in a broken
+        // state and the call silently fails to establish media.
         ws.send(JSON.stringify({ type: 'call-accept', target: call.peerId }));
-        // Also create the connection from our side
-        await getLocalStream();
-        await createConnection(call.peerId, true);
+        await getLocalStream(); // warm up camera/mic before the offer arrives
       } else {
-        // Group call — just connect
+        // Group call — the caller already sent the offer directly (see
+        // callEveryone()); this popup is just a notification. handleOffer()
+        // will connect us as soon as it arrives. Just make sure media is ready.
         await getLocalStream();
-        await createConnection(call.peerId, true);
       }
     } catch (err) {
       console.warn('Accept call error', err);
@@ -2848,6 +2873,15 @@ function hideLocalVideo() {
   updateVideoGrid();
 }
 
+// updateVideoGrid() runs on every ontrack/offer/answer event — which fires
+// separately per connection AND per track (audio + video), often several
+// times a second in a group call. It used to wipe grid.innerHTML and
+// rebuild every box from scratch each time, which tore down and restarted
+// *every* peer's <video> element (including the local preview) whenever
+// *any* single peer's connection changed — causing constant flicker/replay
+// glitches that had nothing to do with that peer. Now it diffs: existing
+// boxes are reused and only their video/no-video content is rebuilt when
+// whether-they-have-video actually changes.
 function updateVideoGrid() {
   const grid = $('#video-grid');
   const idle = $('#idle-state');
@@ -2866,85 +2900,108 @@ function updateVideoGrid() {
     return;
   }
 
-  grid.innerHTML = '';
+  if (idle && idle.parentNode === grid) grid.removeChild(idle);
 
-  // Add local video — always rebuild from current stream state
-  if (showLocal) {
-    const box = document.createElement('div');
-    box.className = 'video-box';
-    box.id = 'local-video-box';
-
-    const hasLiveVideo = STATE.localStream
-      && STATE.localStream.getVideoTracks().filter(t => t.readyState === 'live' && t.enabled).length > 0
-      && STATE.camOn;
-
-    if (hasLiveVideo) {
-      const video = document.createElement('video');
-      video.srcObject = STATE.localStream;
-      video.autoplay = true;
-      video.playsInline = true;
-      video.muted = true;
-      box.appendChild(video);
-      video.play().catch(() => {
-        setTimeout(() => video.play().catch(() => {}), 300);
-      });
-    } else {
-      const noVid = document.createElement('div');
-      noVid.className = 'no-video';
-      noVid.innerHTML = `<div class="avatar-big">${initials(STATE.username)}</div><span>You (audio only)</span>`;
-      box.appendChild(noVid);
-    }
-    const label = document.createElement('div');
-    label.className = 'label';
-    label.textContent = `${STATE.username} (You)`;
-    box.appendChild(label);
-    grid.appendChild(box);
+  // Drop boxes for peers that are no longer connected (or local, if hidden)
+  const wantedIds = new Set(connIds.map(pid => 'peer:' + pid));
+  if (showLocal) wantedIds.add('local');
+  for (const child of Array.from(grid.children)) {
+    if (!wantedIds.has(child.dataset.gridId)) grid.removeChild(child);
   }
 
-  // Add remote videos
+  if (showLocal) {
+    const hasLiveVideo = !!(STATE.localStream
+      && STATE.localStream.getVideoTracks().filter(t => t.readyState === 'live' && t.enabled).length > 0
+      && STATE.camOn);
+    let box = grid.querySelector('[data-grid-id="local"]');
+    if (!box) {
+      box = document.createElement('div');
+      box.className = 'video-box';
+      box.id = 'local-video-box';
+      box.dataset.gridId = 'local';
+    }
+    if (box._hasVideo !== hasLiveVideo) {
+      box.innerHTML = '';
+      if (hasLiveVideo) {
+        const video = document.createElement('video');
+        video.srcObject = STATE.localStream;
+        video.autoplay = true;
+        video.playsInline = true;
+        video.muted = true;
+        box.appendChild(video);
+        video.play().catch(() => {
+          setTimeout(() => video.play().catch(() => {}), 300);
+        });
+      } else {
+        const noVid = document.createElement('div');
+        noVid.className = 'no-video';
+        noVid.innerHTML = `<div class="avatar-big">${initials(STATE.username)}</div><span>You (audio only)</span>`;
+        box.appendChild(noVid);
+      }
+      const label = document.createElement('div');
+      label.className = 'label';
+      label.textContent = `${STATE.username} (You)`;
+      box.appendChild(label);
+      box._hasVideo = hasLiveVideo;
+    }
+    grid.appendChild(box); // (re)position at the end, in order
+  }
+
+  // Add/update remote videos
   for (const pid of connIds) {
     const conn = STATE.connections[pid];
     const peer = STATE.peers.find(p => p.peerId === pid);
     const peerName = peer?.username || 'Peer';
 
-    const box = document.createElement('div');
-    box.className = 'video-box';
-
     // Check for live (not ended) video tracks
     const liveVideoTracks = conn.remoteStream.getVideoTracks().filter(t => t.readyState === 'live');
     const hasVideo = liveVideoTracks.length > 0;
 
-    if (hasVideo) {
-      const video = document.createElement('video');
-      video.srcObject = conn.remoteStream;
-      video.autoplay = true;
-      video.playsInline = true;
-      // Mute the video element — audio is handled by persistent audio elements
-      // that survive background tab throttling
-      video.muted = true;
-      box.appendChild(video);
-      // Explicit play() — autoplay is unreliable on mobile
-      video.play().catch(() => {
-        // Retry after a short delay (user gesture may be needed)
-        setTimeout(() => video.play().catch(() => {}), 500);
-      });
+    let box = grid.querySelector(`[data-grid-id="peer:${pid}"]`);
+    if (!box) {
+      box = document.createElement('div');
+      box.className = 'video-box';
+      box.dataset.gridId = 'peer:' + pid;
+    }
+
+    if (box._hasVideo !== hasVideo) {
+      box.innerHTML = '';
+      if (hasVideo) {
+        const video = document.createElement('video');
+        video.srcObject = conn.remoteStream;
+        video.autoplay = true;
+        video.playsInline = true;
+        // Mute the video element — audio is handled by persistent audio elements
+        // that survive background tab throttling
+        video.muted = true;
+        box.appendChild(video);
+        // Explicit play() — autoplay is unreliable on mobile
+        video.play().catch(() => {
+          // Retry after a short delay (user gesture may be needed)
+          setTimeout(() => video.play().catch(() => {}), 500);
+        });
+      } else {
+        const noVid = document.createElement('div');
+        noVid.className = 'no-video';
+        noVid.innerHTML = `<div class="avatar-big">${initials(peerName)}</div><span>${peerName}</span>`;
+        box.appendChild(noVid);
+      }
+      const label = document.createElement('div');
+      label.className = 'label';
+      label.textContent = peerName;
+      box.appendChild(label);
+      box._hasVideo = hasVideo;
     } else {
-      const noVid = document.createElement('div');
-      noVid.className = 'no-video';
-      noVid.innerHTML = `<div class="avatar-big">${initials(peerName)}</div><span>${peerName}</span>`;
-      box.appendChild(noVid);
+      // Nothing about the video changed — just keep the name label fresh
+      const label = box.querySelector('.label');
+      if (label && label.textContent !== peerName) label.textContent = peerName;
     }
 
     // Audio is handled by persistent audio elements (ensurePersistentAudio)
     // so we don't create inline audio elements here
 
-    const label = document.createElement('div');
-    label.className = 'label';
-    label.textContent = peerName;
-    box.appendChild(label);
-
     conn.videoBox = box;
-    grid.appendChild(box);
+    grid.appendChild(box); // (re)position at the end, in order
   }
 
   // Grid layout class
@@ -4003,34 +4060,6 @@ function removeAllPersistentAudio() {
   }
 }
 
-// Also route remote audio through Web Audio API for background resilience
-const webAudioNodes = {}; // peerId → { source, gain }
-
-function routeThroughWebAudio(peerId, stream) {
-  if (webAudioNodes[peerId]) return;
-  try {
-    const ctx = STATE.audioContext || new (window.AudioContext || window.webkitAudioContext)();
-    STATE.audioContext = ctx;
-    const source = ctx.createMediaStreamSource(stream);
-    const gain = ctx.createGain();
-    gain.gain.value = 1;
-    source.connect(gain);
-    gain.connect(ctx.destination);
-    webAudioNodes[peerId] = { source, gain };
-  } catch (e) {
-    console.warn('Web Audio routing failed for', peerId, e);
-  }
-}
-
-function removeWebAudioRoute(peerId) {
-  if (webAudioNodes[peerId]) {
-    try {
-      webAudioNodes[peerId].source.disconnect();
-      webAudioNodes[peerId].gain.disconnect();
-    } catch (e) { }
-    delete webAudioNodes[peerId];
-  }
-}
 
 // Ensure all media elements are playing (called on visibility change)
 function ensureMediaPlaying() {
