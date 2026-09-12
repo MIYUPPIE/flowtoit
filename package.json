@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node server.js",
     "test": "echo \"Error: no test specified\" && exit 1",
-    "test:webrtc": "node tests/webrtc-call.test.js"
+    "test:webrtc": "node tests/webrtc-call.test.js",
+    "test:branding": "node tests/logo-branding.test.js"
   },
   "keywords": [],
   "author": "",

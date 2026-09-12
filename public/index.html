@@ -432,6 +432,15 @@ main {
   object-fit: cover;
   display: block;
 }
+/* Mirror only your own camera preview, like a mirror/selfie camera — the
+   copy actually sent to other peers (and what they see of you) is never
+   flipped, so this is purely a local display convention. */
+.video-box[data-grid-id="local"] video {
+  transform: scaleX(-1);
+}
+/* Mirror only your own camera preview, like a mirror/selfie camera — the
+   copy actually sent to other peers (and what they see of you) is never
+   flipped, so this is purely a local display convention. */
 .video-box .label {
   position: absolute; bottom: 10px; left: 10px;
   background: rgba(12, 12, 20, .7);
@@ -1474,7 +1483,7 @@ input, select, textarea {
 <!-- ── Setup Overlay ─────────────────────────────────────────────────────── -->
 <div id="setup-overlay">
   <div class="setup-card" id="setup-card">
-    <div class="logo-big"><img src="/logo.png" alt="FlowToIt"></div>
+    <div class="logo-big"><img src="/logo.png" alt="FlowToIt" id="app-logo-setup"></div>
     <h2>FlowToIt</h2>
     <div class="step-indicator">
       <span class="step-dot active" data-step="0"></span>
@@ -1577,6 +1586,20 @@ input, select, textarea {
       <button class="btn-admin primary" id="btn-admin-add-ch" style="width:100%;">+ Add Channel</button>
     </div>
     <div class="admin-section" style="border-top:1px solid rgba(255,255,255,.06); padding-top:16px; margin-top:8px;">
+      <h4>Branding</h4>
+      <div style="display:flex; align-items:center; gap:12px; margin-bottom:12px;">
+        <div style="width:56px; height:56px; border-radius:14px; overflow:hidden; background:var(--surface2); flex-shrink:0; display:flex; align-items:center; justify-content:center;">
+          <img id="admin-logo-preview" src="/logo.png" alt="Current logo" style="width:100%; height:100%; object-fit:contain;">
+        </div>
+        <div style="font-size:.78rem; color:var(--text-dim); flex:1;">Shown in the header and on the login screen for everyone.</div>
+      </div>
+      <div class="admin-form-row">
+        <input type="file" id="admin-logo-file" accept="image/png,image/jpeg,image/webp,image/gif">
+      </div>
+      <button class="btn-admin primary" id="btn-admin-upload-logo" style="width:100%; margin-bottom:8px;">Upload Logo</button>
+      <button class="btn-admin secondary" id="btn-admin-reset-logo" style="width:100%;">Reset to Default</button>
+    </div>
+    <div class="admin-section" style="border-top:1px solid rgba(255,255,255,.06); padding-top:16px; margin-top:8px;">
       <h4 style="color:var(--danger);">Danger Zone</h4>
       <p style="font-size:.78rem; color:var(--text-dim); margin:8px 0 12px;">Factory reset erases all users, channels, categories, chat history, and admin credentials. This cannot be undone.</p>
       <button class="btn-admin danger" id="btn-admin-reset" style="width:100%;">⚠ Factory Reset</button>
@@ -1599,7 +1622,7 @@ input, select, textarea {
 
 <!-- ── Header ────────────────────────────────────────────────────────────── -->
 <header>
-  <div class="logo"><img src="/logo.png" alt="FlowToIt"></div>
+  <div class="logo"><img src="/logo.png" alt="FlowToIt" id="app-logo-header"></div>
   <h1>FlowToIt</h1>
   <div class="status">
     <div class="dot" id="status-dot"></div>
@@ -1647,7 +1670,7 @@ input, select, textarea {
     <div id="video-grid">
       <!-- Idle state -->
       <div class="idle-state" id="idle-state">
-        <div class="radio-icon"><img src="/logo.png" alt="FlowToIt"></div>
+        <div class="radio-icon"><img src="/logo.png" alt="FlowToIt" id="app-logo-idle"></div>
         <h2>Ready to Talk</h2>
         <p>Click a peer to start a call, or broadcast to everyone in the channel</p>
       </div>
@@ -1791,6 +1814,7 @@ const STATE = {
   showLocal: false,    // show local video in grid
   categories: [],      // [{id, name}]
   channels: [],        // [{name, hasCode, categoryId, description, online}]
+  logoUrl: '/logo.png',
 };
 
 // Device PIN — auto-generated, stored in localStorage for automatic login
@@ -2153,6 +2177,10 @@ async function handleSignal(msg) {
       STATE.channels = msg.channels || [];
       renderChannelBrowser();
       renderAdminChannels();
+      break;
+    }
+    case 'logo-updated': {
+      applyLogo(msg.url);
       break;
     }
     case 'channel-deleted': {
@@ -2830,7 +2858,7 @@ function showBrowserNotification(title, body, tag = 'general') {
   // Only show if page is hidden (background)
   if (document.visibilityState !== 'hidden') return;
   try {
-    const iconUrl = '/logo.png';
+    const iconUrl = STATE.logoUrl || '/logo.png';
     const n = new Notification(title, {
       body,
       icon: iconUrl,
@@ -3499,8 +3527,25 @@ function showSetupStep(stepId) {
   });
 }
 
+// ── Branding (admin-uploaded logo) ──────────────────────────────────────────
+function applyLogo(url) {
+  STATE.logoUrl = url;
+  document.querySelectorAll('#app-logo-setup, #app-logo-header, #app-logo-idle').forEach(img => {
+    img.src = url;
+  });
+}
+
+async function loadBranding() {
+  try {
+    const res = await fetch('/api/branding');
+    const data = await res.json();
+    if (data.logoUrl) applyLogo(data.logoUrl);
+  } catch (e) {}
+}
+
 // On page load: try auto-login via device PIN, or show manual login
 async function initSetup() {
+  loadBranding();
   try {
     const res = await fetch('/api/admin-exists');
     const data = await res.json();
@@ -3688,6 +3733,8 @@ $('#btn-admin').addEventListener('click', () => {
     renderAdminCategories();
     renderAdminChannels();
     refreshAdminCatSelect();
+    $('#admin-logo-preview').src = STATE.logoUrl || '/logo.png';
+    $('#admin-logo-file').value = '';
   }
 });
 $('#btn-close-admin').addEventListener('click', () => {
@@ -3758,6 +3805,60 @@ $('#btn-admin-add-ch').addEventListener('click', () => {
   $('#admin-ch-name').value = '';
   $('#admin-ch-desc').value = '';
   $('#admin-ch-code').value = '';
+});
+
+// Branding — logo upload
+$('#admin-logo-file').addEventListener('change', () => {
+  const file = $('#admin-logo-file').files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => { $('#admin-logo-preview').src = reader.result; };
+  reader.readAsDataURL(file);
+});
+
+// Downscale + normalize to PNG client-side so uploads stay small regardless
+// of the source file's size or format.
+function resizeImageToDataUrl(file, maxDim) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('Could not read file'));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error('Could not decode image'));
+      img.onload = () => {
+        let { width, height } = img;
+        if (width > maxDim || height > maxDim) {
+          const scale = maxDim / Math.max(width, height);
+          width = Math.round(width * scale);
+          height = Math.round(height * scale);
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+        resolve(canvas.toDataURL('image/png'));
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+$('#btn-admin-upload-logo').addEventListener('click', async () => {
+  const file = $('#admin-logo-file').files[0];
+  if (!file) { toast('Choose an image first', true); return; }
+  if (!file.type.startsWith('image/')) { toast('Please choose an image file', true); return; }
+  try {
+    const dataUrl = await resizeImageToDataUrl(file, 512);
+    ws.send(JSON.stringify({ type: 'admin-set-logo', imageDataUrl: dataUrl }));
+  } catch (e) {
+    toast('Failed to read image: ' + e.message, true);
+  }
+});
+
+$('#btn-admin-reset-logo').addEventListener('click', () => {
+  ws.send(JSON.stringify({ type: 'admin-remove-logo' }));
+  $('#admin-logo-file').value = '';
 });
 
 // Init setup on page load

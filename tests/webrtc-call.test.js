@@ -208,6 +208,23 @@ async function main() {
     log(`Alice: video grid stability check: ${JSON.stringify(gridStable)}`);
     if (!gridStable.ok) failures.push(`Alice: local <video> element was recreated by a redundant updateVideoGrid() call (flicker bug regression): ${JSON.stringify(gridStable)}`);
 
+    // --- Mirroring: only the local self-view should be mirrored, never the
+    // remote peer's video (that would show the remote peer backwards) ---
+    const mirrorCheck = await pageA.evaluate(() => {
+      const localVideo = document.querySelector('[data-grid-id="local"] video');
+      const remoteVideo = document.querySelector('[data-grid-id^="peer:"] video');
+      const isMirrored = (el) => !!el && getComputedStyle(el).transform === 'matrix(-1, 0, 0, 1, 0, 0)';
+      return {
+        hasLocalVideo: !!localVideo,
+        hasRemoteVideo: !!remoteVideo,
+        localMirrored: isMirrored(localVideo),
+        remoteMirrored: isMirrored(remoteVideo),
+      };
+    });
+    log(`Alice: mirror check: ${JSON.stringify(mirrorCheck)}`);
+    if (!mirrorCheck.hasLocalVideo || !mirrorCheck.localMirrored) failures.push(`Alice: local self-view is not mirrored (flipped-video bug regression): ${JSON.stringify(mirrorCheck)}`);
+    if (mirrorCheck.hasRemoteVideo && mirrorCheck.remoteMirrored) failures.push(`Alice: remote peer's video is mirrored — Bob would appear backwards to Alice: ${JSON.stringify(mirrorCheck)}`);
+
     await ctxA.close();
     await ctxB.close();
   } finally {
