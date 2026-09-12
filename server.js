@@ -66,7 +66,7 @@ if (hasCerts) {
   console.warn('  ⚠  Running HTTP only. WebRTC features may be limited.');
   server = http.createServer(app);
 }
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocket.Server({ server, maxPayload: 8 * 1024 * 1024 }); // 8MB — room for a base64 logo upload
 
 if (server instanceof https.Server) {
   const redir = http.createServer((req, res) => {
@@ -80,6 +80,16 @@ if (server instanceof https.Server) {
 }
 
 app.use(express.static(path.join(__dirname, 'public')));
+
+// ── Custom branding (admin-uploaded logo) ──────────────────────────────────
+const UPLOADS_DIR = path.join(__dirname, 'uploads');
+fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+app.use('/uploads', express.static(UPLOADS_DIR));
+
+function currentLogoUrl() {
+  if (DB.logo && DB.logo.filename) return `/uploads/${DB.logo.filename}?v=${DB.logo.updatedAt}`;
+  return '/logo.png';
+}
 
 // ── Persistent Data Store ───────────────────────────────────────────────────
 const DATA_FILE = path.join(__dirname, 'data.json');
@@ -103,6 +113,7 @@ if (!DB.channels['general']) {
   DB.channels['general'] = { code: null, categoryId: 'default', createdBy: 'system', createdAt: Date.now(), description: 'Default channel' };
 }
 if (!DB.chatHistory) DB.chatHistory = {};
+if (DB.logo === undefined) DB.logo = null; // { filename, updatedAt } | null = default logo.png
 saveData();
 
 const CHAT_HISTORY_LIMIT = 200;
@@ -180,6 +191,8 @@ app.get('/api/users', (req, res) => {
 app.get('/api/usernames', (req, res) => {
   res.json(Object.keys(DB.users));
 });
+
+app.get('/api/branding', (req, res) => res.json({ logoUrl: currentLogoUrl() }));
 
 app.get('/api/channels', (req, res) => res.json(getChannelList()));
 app.get('/api/categories', (req, res) => {
@@ -407,6 +420,50 @@ wss.on('connection', (ws) => {
         break;
       }
 
+      case 'admin-set-logo': {
+        const c = clients.get(peerId);
+        if (!c?.isAdmin) { sendTo(peerId, { type: 'admin-error', error: 'Not authorized' }); break; }
+        const dataUrl = msg.imageDataUrl || '';
+        const match = /^data:image\/(png|jpe?g|webp|gif);base64,([A-Za-z0-9+/=]+)$/.exec(dataUrl);
+        if (!match) { sendTo(peerId, { type: 'admin-error', error: 'Invalid image data' }); break; }
+        const ext = match[1] === 'jpeg' ? 'jpg' : match[1];
+        const buffer = Buffer.from(match[2], 'base64');
+        const MAX_LOGO_BYTES = 3 * 1024 * 1024; // 3MB
+        if (buffer.length === 0 || buffer.length > MAX_LOGO_BYTES) {
+          sendTo(peerId, { type: 'admin-error', error: 'Image must be under 3MB' });
+          break;
+        }
+        if (DB.logo?.filename) {
+          try { fs.unlinkSync(path.join(UPLOADS_DIR, DB.logo.filename)); } catch {}
+        }
+        const filename = `logo-${Date.now()}.${ext}`;
+        try {
+          fs.writeFileSync(path.join(UPLOADS_DIR, filename), buffer);
+        } catch (e) {
+          sendTo(peerId, { type: 'admin-error', error: 'Failed to save logo' });
+          break;
+        }
+        DB.logo = { filename, updatedAt: Date.now() };
+        saveData();
+        broadcastAll({ type: 'logo-updated', url: currentLogoUrl() });
+        sendTo(peerId, { type: 'admin-success', message: 'Logo updated' });
+        break;
+      }
+
+      case 'admin-remove-logo': {
+        const c = clients.get(peerId);
+        if (!c?.isAdmin) { sendTo(peerId, { type: 'admin-error', error: 'Not authorized' }); break; }
+        if (!DB.logo) { sendTo(peerId, { type: 'admin-error', error: 'Already using the default logo' }); break; }
+        if (DB.logo.filename) {
+          try { fs.unlinkSync(path.join(UPLOADS_DIR, DB.logo.filename)); } catch {}
+        }
+        DB.logo = null;
+        saveData();
+        broadcastAll({ type: 'logo-updated', url: currentLogoUrl() });
+        sendTo(peerId, { type: 'admin-success', message: 'Logo reset to default' });
+        break;
+      }
+
       case 'admin-reset': {
         const c = clients.get(peerId);
         if (!c?.isAdmin) { sendTo(peerId, { type: 'admin-error', error: 'Not authorized' }); break; }
@@ -419,13 +476,18 @@ wss.on('connection', (ws) => {
         }
         clients.clear();
         liveChannels.clear();
+        // Remove any custom logo
+        if (DB.logo?.filename) {
+          try { fs.unlinkSync(path.join(UPLOADS_DIR, DB.logo.filename)); } catch {}
+        }
         // Reset database to factory defaults
         DB = {
           adminCode: null,
           users: {},
           categories: { 'default': { name: 'General', createdBy: 'system', createdAt: Date.now() } },
           channels: { 'general': { code: null, categoryId: 'default', createdBy: 'system', createdAt: Date.now(), description: 'Default channel' } },
-          chatHistory: {}
+          chatHistory: {},
+          logo: null,
         };
         saveData();
         console.log('  \u26A0  Server reset by admin:', c.username);
